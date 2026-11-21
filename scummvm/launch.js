@@ -23,25 +23,74 @@ async function fetchFile(path) {
   if (!response.ok) throw Error(path + ' returned ' + response.status);
   return new Uint8Array(await response.arrayBuffer());
 }
-async function mountPresentation() {
-  const files = JSON.parse(new TextDecoder().decode(await fetchFile('movie-files.json')));
-  FS.mkdirTree('/heart');
-  for (const name of files) {
-    if (name.includes('/')) FS.mkdirTree('/heart/' + name.split('/')[0]);
-  }
-  let completed = 0;
-  const pending = files.slice();
-  async function loadMovies() {
-    while (pending.length) {
-      const name = pending.shift();
-      FS.writeFile('/heart/' + name, await fetchFile('../movies/' + name));
-      statusLine.textContent = 'Loading presentation files ' + (++completed) + ' / ' + files.length;
+const supportFiles = ['plugins/libdirector.so', 'classicmacfonts.dat', 'scummmodern.zip', 'fonts.dat', 'macgui.dat'];
+const projector = 'HEARTSND.EXE';
+let startupAssets;
+
+function mountMovie(name, size) {
+  const path = '/heart/' + name;
+  FS.mkdirTree(path.slice(0, path.lastIndexOf('/')));
+  const node = FS.create(path, 0o444);
+  node.usedBytes = size;
+  const streamOps = node.stream_ops;
+  function loadMovie() {
+    if (node.contents.length === size) return;
+    // Director reads movies synchronously. Keep their bytes in MEMFS after the first read.
+    const request = new XMLHttpRequest();
+    try {
+      request.open('GET', '../movies/' + name, false);
+      request.overrideMimeType('text/plain; charset=x-user-defined');
+      request.send();
+      const data = request.responseText;
+      if (request.status !== 200 || data.length !== size) {
+        throw Error('Unexpected status or file size');
+      }
+      const bytes = new Uint8Array(size);
+      for (let i = 0; i < size; i++) bytes[i] = data.charCodeAt(i);
+      node.contents = bytes;
+      if (statusLine.textContent.startsWith('Could not load ' + name + '.')) {
+        statusLine.textContent = '';
+      }
+    } catch (error) {
+      console.warn('Could not load ' + name, error);
+      statusLine.textContent = 'Could not load ' + name + '. Try opening the lesson again.';
+      throw new FS.ErrnoError(29); // EIO
     }
   }
-  await Promise.all(Array.from({length: 5}, loadMovies));
+  node.stream_ops = {
+    ...streamOps,
+    read(...args) {
+      loadMovie();
+      return streamOps.read(...args);
+    },
+    mmap(...args) {
+      loadMovie();
+      return streamOps.mmap(...args);
+    }
+  };
+}
+
+async function loadStartupAssets() {
+  return Promise.all([
+    fetch('movie-sizes.json').then(response => {
+      if (!response.ok) throw Error('Could not load the presentation file list.');
+      return response.json();
+    }),
+    fetchFile('../movies/' + projector),
+    Promise.all(supportFiles.map(file => fetchFile('data/' + file)))
+  ]);
+}
+
+async function mountPresentation() {
+  const [movies, projectorBytes, supportBytes] = await startupAssets;
+  FS.mkdirTree('/heart');
+  FS.writeFile('/heart/' + projector, projectorBytes);
+  for (const [name, size] of Object.entries(movies)) {
+    if (name !== projector) mountMovie(name, size);
+  }
   FS.mkdirTree('/support/plugins');
-  for (const file of ['plugins/libdirector.so', 'classicmacfonts.dat', 'scummmodern.zip', 'fonts.dat', 'macgui.dat']) {
-    const bytes = await fetchFile('data/' + file);
+  for (const [index, file] of supportFiles.entries()) {
+    const bytes = supportBytes[index];
     if (file === 'plugins/libdirector.so') {
       // This projector keeps a mouse handler suspended while a child lesson plays.
       // Allow the next input event through the pinned engine's processEvents guard.
@@ -80,15 +129,24 @@ var Module = {
 };
 document.getElementById('start').onclick = async function () {
   this.hidden = true;
-  const context = new AudioContext();
-  await context.resume();
-  const { createLessonAudio } = await import('./lesson-audio.js');
-  lessonAudio = createLessonAudio(context);
   statusLine.textContent = 'Loading Director…';
-  history.replaceState(null, '', '#--config=/heart.ini heart');
-  const script = document.createElement('script');
-  script.src = 'scummvm.js';
-  script.onerror = () => { statusLine.textContent = 'Could not load the Director runtime.'; };
-  document.body.append(script);
+  startupAssets = loadStartupAssets();
+  // The runtime consumes this promise in preRun. Handle an early rejection until then.
+  startupAssets.catch(() => {});
+  try {
+    const context = new AudioContext();
+    const [, { createLessonAudio }] = await Promise.all([
+      context.resume(), import('./lesson-audio.js')
+    ]);
+    lessonAudio = createLessonAudio(context);
+    history.replaceState(null, '', '#--config=/heart.ini heart');
+    const script = document.createElement('script');
+    script.src = 'scummvm.js';
+    script.onerror = () => { statusLine.textContent = 'Could not load the Director runtime.'; };
+    document.body.append(script);
+  } catch (error) {
+    statusLine.textContent = 'Could not start playback. ' + error.message;
+    this.hidden = false;
+  }
 };
 
